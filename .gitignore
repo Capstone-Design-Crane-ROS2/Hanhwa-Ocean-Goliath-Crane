@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ROS2 colcon 빌드 산출물
+build/
+install/
+log/
+
+# ROS bag / 원본 센서 데이터 (대용량)
+*.bag
+*.db3
+*.db3-shm
+*.db3-wal
+*.mcap
+rosbag2_*/
+bags/
+data/
+*.pcd
+*.ply
+
+# 대용량 파일 / 모델 가중치
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# 인증키 / 환경변수
+.env
+.env.*
+*.pem
+*.key
+*.crt
+credentials*.json
+secrets*
+
+# OS / 에디터
+.DS_Store
+.vscode/
+.idea/
