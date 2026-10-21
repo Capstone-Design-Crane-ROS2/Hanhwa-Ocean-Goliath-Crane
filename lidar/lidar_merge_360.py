@@ -23,9 +23,41 @@ class LidarMerger(Node):
         )
 
         self.buffer = []
+        self.last_stamp_ns = None
+        self.max_interval_ns = 100_000_000  # 0.1초 (임시 기준)
 
     def callback(self, msg):
-        # 이번 120도 메시지를 버퍼에 저장
+        stamp_ns = (
+            msg.header.stamp.sec * 1_000_000_000
+            + msg.header.stamp.nanosec
+        )
+
+        # 기존 메시지와 시간 및 좌표계 비교
+        if self.last_stamp_ns is not None:
+            interval_ns = stamp_ns - self.last_stamp_ns
+
+            if interval_ns <= 0:
+                self.get_logger().warn(
+                    'Timestamp 역행 또는 중복 감지: 버퍼 초기화'
+                )
+                self.buffer.clear()
+
+            elif interval_ns > self.max_interval_ns:
+                self.get_logger().warn(
+                    f'메시지 간격 초과 ({interval_ns / 1e9:.3f}s): '
+                    '버퍼 초기화'
+                )
+                self.buffer.clear()
+
+        if self.buffer and (
+            msg.header.frame_id != self.buffer[0].header.frame_id
+        ):
+            self.get_logger().warn(
+                'frame_id 불일치: 버퍼 초기화'
+            )
+            self.buffer.clear()
+
+        self.last_stamp_ns = stamp_ns
         self.buffer.append(msg)
 
         print(
@@ -33,13 +65,11 @@ class LidarMerger(Node):
             f'stamp={msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d}'
         )
 
-        # 3개 모일 때까지 기다림
         if len(self.buffer) < 3:
             return
 
         merged_points = []
 
-        # 3개 PointCloud2의 x, y, z를 모두 이어붙임
         for cloud in self.buffer:
             points = point_cloud2.read_points(
                 cloud,
@@ -52,18 +82,15 @@ class LidarMerger(Node):
                 y = float(p[1])
                 z = float(p[2])
 
-                # 무효 포인트 제거
                 if x == 0.0 and y == 0.0 and z == 0.0:
                     continue
 
                 merged_points.append((x, y, z))
 
-        # 출력 메시지 header
         header = Header()
         header.stamp = self.buffer[-1].header.stamp
         header.frame_id = self.buffer[-1].header.frame_id
 
-        # xyz PointCloud2 생성
         merged_cloud = point_cloud2.create_cloud_xyz32(
             header,
             merged_points
@@ -77,7 +104,6 @@ class LidarMerger(Node):
         )
         print('---')
 
-        # 다음 3프레임을 위해 초기화
         self.buffer.clear()
 
 
@@ -89,9 +115,9 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
