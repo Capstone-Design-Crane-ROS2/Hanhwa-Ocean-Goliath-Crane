@@ -5,6 +5,8 @@
     python3 lidar/lidar_roi_node.py --ros-args -p roi.x_min:=-20.0 -p roi.x_max:=20.0
 """
 
+import array
+
 import numpy as np
 import rclpy
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
@@ -63,7 +65,10 @@ def xyz_to_cloud(header, points):
     msg.point_step = 12
     msg.row_step = msg.point_step * msg.width
     msg.is_dense = True  # ROI 필터에서 NaN/Inf 제거됨
-    msg.data = pts.tobytes()
+    # bytes 대입은 rclpy setter가 바이트마다 검사해 ~240ms 소요 -> array.array 사용
+    data = array.array('B')
+    data.frombytes(pts.tobytes())
+    msg.data = data
     return msg
 
 
