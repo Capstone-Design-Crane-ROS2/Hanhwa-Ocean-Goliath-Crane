@@ -84,9 +84,14 @@ class LidarRoiNode(Node):
         self.bounds = self._read_bounds()
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
-        # 구독: 센서 데이터용 QoS (BEST_EFFORT) -> RELIABLE/BEST_EFFORT 발행자 모두 수신 가능
+        # 구독: RELIABLE (대용량 PointCloud2 프레임 유실 방지)
+        sub_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
         self.subscription = self.create_subscription(
-            PointCloud2, input_topic, self.callback, qos_profile_sensor_data
+            PointCloud2, input_topic, self.callback, sub_qos
         )
         # 발행: RELIABLE -> RViz2 기본 설정 및 BEST_EFFORT 구독자 모두 호환
         pub_qos = QoSProfile(
