@@ -167,11 +167,15 @@ def box_iou(min_a, max_a, min_b, max_b):
     return float(overlap / union) if union > 0 else 0.0
 
 
-def evaluate_frame(points, boxes, pose, config, sensor_world):
+def evaluate_frame(points, boxes, pose, config, sensor_world,
+                   return_objects=False):
     """Run the module on a frame and compare it with the GT boxes.
 
     Returns:
         (records, stats): one record per GT object, and frame statistics.
+        With return_objects, (records, stats, objects, matches): also the
+        frame's LidarObjects and {GT id: object index} for the GT objects
+        matched to a cluster (status ok or split).
     """
     start = time.perf_counter()
     keep = np.flatnonzero(height_band_mask(
@@ -194,6 +198,7 @@ def evaluate_frame(points, boxes, pose, config, sensor_world):
 
     all_labels = None
     matched = set()
+    matches = {}
     records = []
     for object_id, cls, corners in boxes:
         mask = inside_box(world, corners)
@@ -242,6 +247,7 @@ def evaluate_frame(points, boxes, pose, config, sensor_world):
 
         obj = objects[best]
         matched.add(best)
+        matches[object_id] = best
         if record.get("status") is None:
             record["status"] = "ok"
         gt_min, gt_max = corners.min(axis=0), corners.max(axis=0)
@@ -277,6 +283,8 @@ def evaluate_frame(points, boxes, pose, config, sensor_world):
         "cluster_ms": cluster_ms,
         "estimate_ms": estimate_ms,
     }
+    if return_objects:
+        return records, stats, objects, matches
     return records, stats
 
 

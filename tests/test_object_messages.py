@@ -147,5 +147,49 @@ class MarkerTest(unittest.TestCase):
         self.assertEqual(len(markers), 3)
 
 
+class TrackIdTest(unittest.TestCase):
+    def test_json_without_tracking_has_no_track_id(self):
+        _, objects = make_objects()
+        data = json.loads(frame_to_json(make_frame(objects)))
+        for item in data["objects"]:
+            self.assertNotIn("track_id", item)
+
+    def test_json_track_ids_and_null(self):
+        _, objects = make_objects()
+        data = json.loads(frame_to_json(make_frame(objects), [7, None]))
+        self.assertEqual([o["id"] for o in data["objects"]], [0, 1])
+        self.assertEqual([o["track_id"] for o in data["objects"]],
+                         [7, None])
+
+    def test_json_rest_unchanged_by_tracking(self):
+        _, objects = make_objects()
+        plain = json.loads(frame_to_json(make_frame(objects)))
+        tracked = json.loads(frame_to_json(make_frame(objects), [3, 4]))
+        for item in tracked["objects"]:
+            del item["track_id"]
+        self.assertEqual(plain, tracked)
+
+    def test_track_ids_length_checked(self):
+        _, objects = make_objects()
+        with self.assertRaises(ValueError):
+            frame_to_json(make_frame(objects), [1])
+
+    def test_markers_follow_track_id(self):
+        _, objects = make_objects()
+        plain = frame_to_markers(HEADER, objects).markers
+        tracked = frame_to_markers(HEADER, objects, track_ids=[9, None])
+        boxes = [m for m in tracked.markers if m.ns == "object_box"]
+        labels = [m for m in tracked.markers if m.ns == "object_label"]
+        # Marker IDs stay the frame-local ids.
+        self.assertEqual([m.id for m in boxes], [0, 1])
+        self.assertEqual(labels[0].text, f"T9 {objects[0].distance:.1f}m")
+        self.assertEqual(labels[1].text, f"#1 {objects[1].distance:.1f}m")
+        # Track 9 has the color object 9 would have; untracked is gray.
+        reference = frame_to_markers(HEADER, objects, track_ids=[9, 9])
+        self.assertEqual(boxes[0].color, reference.markers[1].color)
+        self.assertEqual(boxes[1].color.r, boxes[1].color.g)
+        self.assertNotEqual(boxes[0].color, plain[1].color)
+
+
 if __name__ == "__main__":
     unittest.main()

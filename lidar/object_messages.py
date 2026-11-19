@@ -2,6 +2,10 @@
 
 JSON string: schema lidar-objects-v1, documented in
 docs/lidar_object_estimation.md.
+
+Tracking is optional: when track_ids are given, each JSON object gets a
+"track_id" (int, or null before its track is confirmed) and markers are
+colored and labeled by track ID. Without track_ids the output is unchanged.
 """
 
 import array
@@ -45,9 +49,18 @@ def _rounded(values, digits=3):
     return np.round(np.asarray(values, dtype=np.float64), digits).tolist()
 
 
-def object_to_dict(obj):
-    """JSON-ready dict of one LidarObject."""
-    return {
+_NO_TRACK = object()
+
+# Untracked objects (track not confirmed yet), when tracking is enabled.
+UNTRACKED_COLOR = (0.6, 0.6, 0.6)
+
+
+def object_to_dict(obj, track_id=_NO_TRACK):
+    """JSON-ready dict of one LidarObject.
+
+    track_id is added only when given (None becomes null).
+    """
+    data = {
         "id": obj.id,
         "point_count": obj.point_count,
         "center": _rounded(obj.center),
@@ -62,10 +75,25 @@ def object_to_dict(obj):
         "center_reference": _rounded(obj.center_reference),
         "corners": _rounded(obj.corners),
     }
+    if track_id is not _NO_TRACK:
+        data["track_id"] = None if track_id is None else int(track_id)
+    return data
 
 
-def frame_to_json(frame):
-    """ObjectFrame -> JSON text for /lidar/objects."""
+def _track_list(track_ids, objects):
+    if track_ids is None:
+        return [_NO_TRACK] * len(objects)
+    if len(track_ids) != len(objects):
+        raise ValueError("track_ids must have one entry per object")
+    return list(track_ids)
+
+
+def frame_to_json(frame, track_ids=None):
+    """ObjectFrame -> JSON text for /lidar/objects.
+
+    track_ids: optional, one track ID (or None) per frame.objects entry.
+    """
+    tracks = _track_list(track_ids, frame.objects)
     return json.dumps({
         "schema": OBJECT_SCHEMA,
         "stamp_ns": frame.stamp_ns,
@@ -74,7 +102,10 @@ def frame_to_json(frame):
         "gravity_aligned": frame.gravity_aligned,
         "box_orientation_xyzw": _rounded(frame.box_orientation_xyzw, 6),
         "object_count": len(frame.objects),
-        "objects": [object_to_dict(obj) for obj in frame.objects],
+        "objects": [
+            object_to_dict(obj, track)
+            for obj, track in zip(frame.objects, tracks)
+        ],
     })
 
 
@@ -118,7 +149,17 @@ def _color(object_id, alpha=1.0):
     return ColorRGBA(r=r, g=g, b=b, a=alpha)
 
 
-def _box_marker(header, obj, line_width):
+def _marker_style(obj, track):
+    """(color, label prefix): by track ID when tracking, else by obj.id."""
+    if track is _NO_TRACK:
+        return _color(obj.id), f"#{obj.id}"
+    if track is None:
+        r, g, b = UNTRACKED_COLOR
+        return ColorRGBA(r=r, g=g, b=b, a=1.0), f"#{obj.id}"
+    return _color(track), f"T{track}"
+
+
+def _box_marker(header, obj, line_width, color):
     marker = Marker()
     marker.header = header
     marker.ns = "object_box"
@@ -127,7 +168,7 @@ def _box_marker(header, obj, line_width):
     marker.action = Marker.ADD
     marker.pose.orientation.w = 1.0
     marker.scale.x = line_width
-    marker.color = _color(obj.id)
+    marker.color = color
     corners = obj.corners.tolist()
     marker.points = [
         Point(x=corners[i][0], y=corners[i][1], z=corners[i][2])
@@ -136,7 +177,7 @@ def _box_marker(header, obj, line_width):
     return marker
 
 
-def _label_marker(header, obj, text_height):
+def _label_marker(header, obj, text_height, color, prefix):
     marker = Marker()
     marker.header = header
     marker.ns = "object_label"
@@ -154,25 +195,31 @@ def _label_marker(header, obj, text_height):
     marker.pose.position.z = float(top[2])
     marker.pose.orientation.w = 1.0
     marker.scale.z = text_height
-    marker.color = _color(obj.id)
-    marker.text = f"#{obj.id} {obj.distance:.1f}m"
+    marker.color = color
+    marker.text = f"{prefix} {obj.distance:.1f}m"
     return marker
 
 
 def frame_to_markers(header, objects, line_width=0.05, text_height=0.6,
-                     show_labels=True):
+                     show_labels=True, track_ids=None):
     """MarkerArray with one wireframe box and label per object.
 
     The first marker is DELETEALL, so boxes of the previous frame never
     remain when the object count drops; an empty frame clears the display.
+    Marker IDs stay obj.id. With track_ids, a tracked object keeps its color
+    across frames and is labeled "T<track_id>"; unconfirmed ones are gray.
     """
+    tracks = _track_list(track_ids, objects)
     clear = Marker()
     clear.header = header
     clear.action = Marker.DELETEALL
 
     markers = [clear]
-    for obj in objects:
-        markers.append(_box_marker(header, obj, line_width))
+    for obj, track in zip(objects, tracks):
+        color, prefix = _marker_style(obj, track)
+        markers.append(_box_marker(header, obj, line_width, color))
         if show_labels:
-            markers.append(_label_marker(header, obj, text_height))
+            markers.append(
+                _label_marker(header, obj, text_height, color, prefix)
+            )
     return MarkerArray(markers=markers)

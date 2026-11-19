@@ -6,6 +6,12 @@ Output: /lidar/objects               String JSON, one per input frame
         /lidar/objects/markers       MarkerArray for RViz2
         /lidar/objects/points        PointCloud2 with an object_id field
 
+Objects are tracked across frames (object_tracker.py, enabled by default):
+each JSON object gets a track_id that stays the same for one physical
+object, and markers keep their color per track. The frame-local id and the
+object_id field of the points cloud are unchanged.
+tracker.enabled:=false restores the untracked output exactly.
+
 All outputs reuse the input header (stamp, frame_id). Every input frame gets
 outputs, also when empty or when processing fails, so a consumer can detect
 a real drop by a missing stamp.
@@ -45,12 +51,19 @@ from object_estimator import (
     height_band_mask,
 )
 from object_messages import frame_to_json, frame_to_markers, labeled_cloud
+from object_tracker import ObjectTracker, TrackerParams
 
 
 # Height band above ground: keeps the tallest GT object (9.19 m) and drops
 # roofs and upper walls, about half of the points on the S2/S4/S7 scenes.
 DEFAULT_CROP_MIN_HEIGHT = -1.0
 DEFAULT_CROP_MAX_HEIGHT = 10.0
+
+TRACKER_PARAMS = (
+    "accel_std", "meas_std_xy", "meas_std_z", "init_vel_std", "gate_chi2",
+    "max_gate_distance", "min_hits", "max_coast_s", "tentative_coast_s",
+    "max_gap_s",
+)
 
 STARTUP_ONLY = (
     "input_topic", "output_topic", "marker_topic", "points_topic",
@@ -106,7 +119,13 @@ class LidarObjectNode(Node):
         self.declare_parameter("crop.min_height", DEFAULT_CROP_MIN_HEIGHT)
         self.declare_parameter("crop.max_height", DEFAULT_CROP_MAX_HEIGHT)
         self.declare_parameter("marker.show_labels", True)
+        self.declare_parameter("tracker.enabled", True)
+        for name in TRACKER_PARAMS:
+            self.declare_parameter(
+                f"tracker.{name}", getattr(TrackerParams, name)
+            )
 
+        self.tracker = None
         self._apply_settings(self._read_settings())
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -147,6 +166,7 @@ class LidarObjectNode(Node):
         self.total_rejected = 0
         self.cluster_ms = []
         self.estimate_ms = []
+        self.track_ms = []
         self.total_ms = []
 
         self.get_logger().info(
@@ -183,6 +203,13 @@ class LidarObjectNode(Node):
             ),
             "crop": (crop_min, crop_max),
             "show_labels": bool(value("marker.show_labels")),
+            "tracking": bool(value("tracker.enabled")),
+            "tracker": TrackerParams(**{
+                name: (int if name == "min_hits" else float)(
+                    value(f"tracker.{name}")
+                )
+                for name in TRACKER_PARAMS
+            }),
         }
 
     def _apply_settings(self, settings):
@@ -190,6 +217,13 @@ class LidarObjectNode(Node):
         self.estimator_params = settings["estimate"]
         self.crop = settings["crop"]
         self.show_labels = settings["show_labels"]
+        if not settings["tracking"]:
+            self.tracker = None
+        elif self.tracker is None:
+            self.tracker = ObjectTracker(settings["tracker"])
+        else:
+            # Keeps the current tracks; new values apply from the next frame.
+            self.tracker.params = settings["tracker"]
 
     def _settings_text(self):
         cluster = self.extractor.params
@@ -199,7 +233,18 @@ class LidarObjectNode(Node):
             f"points=[{cluster.min_points}, {cluster.max_points}] "
             f"crop={self.crop}m center={estimate.center_method} "
             f"max_footprint={estimate.max_footprint}m "
-            f"max_height={estimate.max_height}m"
+            f"max_height={estimate.max_height}m "
+            f"tracking={self._tracker_text()}"
+        )
+
+    def _tracker_text(self):
+        if self.tracker is None:
+            return "off"
+        params = self.tracker.params
+        return (
+            f"on(min_hits={params.min_hits} "
+            f"max_coast={params.max_coast_s}s "
+            f"gate={params.max_gate_distance}m)"
         )
 
     def _on_set_parameters(self, params):
@@ -240,7 +285,10 @@ class LidarObjectNode(Node):
             return None
 
     def process(self, msg):
-        """Returns (points, ObjectFrame) for one input message."""
+        """Returns (points, ObjectFrame, track_ids) for one input message.
+
+        track_ids is None when tracking is disabled.
+        """
         points = cloud_to_xyz(msg)
         pose = self.lookup_pose(msg.header.frame_id)
         gravity_aligned = pose is not None
@@ -276,14 +324,24 @@ class LidarObjectNode(Node):
             box_orientation_xyzw=pose.box_orientation_xyzw,
             objects=objects,
         )
-        return points, frame
+
+        track_ids = None
+        if self.tracker is not None:
+            start = time.perf_counter()
+            track_ids = self.tracker.update(
+                frame.stamp_ns,
+                [obj.center_reference for obj in objects],
+                frame.reference_frame,
+            )
+            self.track_ms.append((time.perf_counter() - start) * 1e3)
+        return points, frame, track_ids
 
     def callback(self, msg):
         start = time.perf_counter()
         self.received += 1
 
         try:
-            points, frame = self.process(msg)
+            points, frame, track_ids = self.process(msg)
         except Exception as exc:
             # Keep the frame visible downstream as an empty result.
             self.failed += 1
@@ -297,10 +355,16 @@ class LidarObjectNode(Node):
                 box_orientation_xyzw=IDENTITY_POSE.box_orientation_xyzw,
                 objects=[],
             )
+            # The tracker did not see this frame; the next real stamp
+            # difference covers the gap.
+            track_ids = None if self.tracker is None else []
 
-        self.object_publisher.publish(String(data=frame_to_json(frame)))
+        self.object_publisher.publish(String(
+            data=frame_to_json(frame, track_ids)
+        ))
         self.marker_publisher.publish(frame_to_markers(
             msg.header, frame.objects, show_labels=self.show_labels,
+            track_ids=track_ids,
         ))
         self.points_publisher.publish(
             labeled_cloud(msg.header, points, frame.objects)
@@ -312,10 +376,13 @@ class LidarObjectNode(Node):
         self.total_ms.append(elapsed_ms)
 
         if self.published % 30 == 0:
+            tracks = track_ids or [None] * len(frame.objects)
             nearest = ", ".join(
-                f"#{obj.id} {obj.distance:.1f}m "
+                f"#{obj.id}"
+                + (f"/T{track}" if track is not None else "")
+                + f" {obj.distance:.1f}m "
                 f"{np.round(obj.size, 1).tolist()} n={obj.point_count}"
-                for obj in frame.objects[:3]
+                for obj, track in zip(frame.objects[:3], tracks)
             )
             self.get_logger().info(
                 f"frames={self.published} objects={len(frame.objects)} "
@@ -341,8 +408,16 @@ class LidarObjectNode(Node):
             f"rejected={self.total_rejected}, "
             f"cluster {self._timing(self.cluster_ms)}, "
             f"estimate {self._timing(self.estimate_ms)}, "
+            f"track {self._timing(self.track_ms)}, "
             f"total {self._timing(self.total_ms)}"
         )
+        if self.tracker is not None:
+            self.get_logger().info(
+                f"Tracker stats: tracks_created={self.tracker.next_id}, "
+                f"active={len(self.tracker.tracks)}, "
+                f"confirmed={len(self.tracker.confirmed_tracks)}, "
+                f"resets={self.tracker.resets}"
+            )
 
 
 def main():

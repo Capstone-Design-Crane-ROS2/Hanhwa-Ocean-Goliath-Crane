@@ -8,10 +8,13 @@
 |---|---|---|
 | `lidar/cluster_extractor.py` | 어떤 포인트가 한 객체인가 (`ObjectExtractor`, `EuclideanClusterExtractor`) | NumPy, SciPy |
 | `lidar/object_estimator.py` | 포인트 그룹 → 위치·거리·크기·박스 (`estimate_objects`) | NumPy |
+| `lidar/object_tracker.py` | 프레임 간 동일 객체 추적, `track_id` 부여 (`ObjectTracker`) | NumPy, SciPy |
 | `lidar/object_messages.py` | 결과 → JSON, MarkerArray, 라벨 PointCloud2 | ROS 메시지 |
 | `lidar/lidar_object_node.py` | 위 모듈을 연결하는 ROS2 노드 | rclpy, tf2_ros |
 | `tools/eval_objects_gt.py` | bag과 GT를 직접 읽는 오프라인 정확도 평가 | rclpy 직렬화 |
 | `tools/object_topic_monitor.py` | 재생 중 출력 토픽의 누락·중복·정합성 점검 | rclpy |
+| `tools/eval_tracking_gt.py` | GT `object_id` 기준 오프라인 추적 평가 (ID Switch, 유지율) | rclpy 직렬화 |
+| `tools/eval_tracking_topics.py` | 모니터 기록(실제 발행 JSON)의 `track_id`를 GT와 비교 | rclpy 직렬화 |
 
 ## 실행
 
@@ -42,6 +45,15 @@ ros2 bag play <bag 디렉터리>/bag
 
 ```bash
 python3 tools/eval_objects_gt.py <시나리오 또는 bag 디렉터리>... --json result.json
+python3 tools/eval_tracking_gt.py <시나리오 또는 bag 디렉터리>... --json tracking.json
+#   --drop-rate 0.3 : 프레임 무작위 누락,  --fixed-dt : 고정 주기 가정(비교용)
+```
+
+재생 중 실제 발행값으로 추적을 확인할 때는 모니터 기록을 GT와 비교한다.
+
+```bash
+python3 tools/object_topic_monitor.py --out report.json      # bag 재생 동안 실행
+python3 tools/eval_tracking_topics.py report.json <bag 디렉터리>
 ```
 
 ## 토픽
@@ -70,6 +82,18 @@ python3 tools/eval_objects_gt.py <시나리오 또는 bag 디렉터리>... --jso
 | `estimate.max_footprint` | 15.0 | 박스 수평 변 상한 [m], 0이면 해제 |
 | `estimate.max_height` | 0.0 | 박스 높이 상한 [m], 0이면 해제 |
 | `marker.show_labels` | true | 라벨 표시 여부 |
+| `tracker.enabled` | true | 추적 사용. false면 `track_id` 없이 기존 출력과 동일 |
+| `tracker.min_hits` | 3 | 확정에 필요한 연속 매칭 횟수 (확정 전 `track_id`는 null) |
+| `tracker.max_coast_s` | 1.5 | 확정 트랙이 미검출 상태로 유지되는 시간 [s]. 이 안에 재검출되면 같은 ID |
+| `tracker.tentative_coast_s` | 0.2 | 미확정 트랙 유지 시간 [s] |
+| `tracker.max_gate_distance` | 3.0 | 예측 위치와 검출 사이 최대 수평 거리 [m] |
+| `tracker.gate_chi2` | 11.345 | 마할라노비스 거리² 게이트 (3자유도 99%) |
+| `tracker.accel_std` | 2.0 | 등속 모델 가속도 잡음 [m/s²] |
+| `tracker.meas_std_xy`, `tracker.meas_std_z` | 0.3, 0.5 | 중심 측정 잡음 [m] |
+| `tracker.init_vel_std` | 3.0 | 새 트랙 속도 불확실성 [m/s] |
+| `tracker.max_gap_s` | 2.0 | 프레임 간격이 이보다 크면 모든 트랙 초기화 [s] |
+
+`tracker.*` 값을 실행 중 바꾸면 현재 트랙은 유지된 채 다음 프레임부터 적용된다. `tracker.enabled`를 껐다 켜면 트랙이 초기화된다.
 
 ## `/lidar/objects` JSON (`lidar-objects-v1`)
 
@@ -95,7 +119,8 @@ python3 tools/eval_objects_gt.py <시나리오 또는 bag 디렉터리>... --jso
     "bbox_min_reference": [0, 0, 0],
     "bbox_max_reference": [0, 0, 0],
     "center_reference": [0, 0, 0],
-    "corners": [[0, 0, 0]]
+    "corners": [[0, 0, 0]],
+    "track_id": 12
   }]
 }
 ```
@@ -111,8 +136,18 @@ python3 tools/eval_objects_gt.py <시나리오 또는 bag 디렉터리>... --jso
 | `bbox_*_reference`, `center_reference` | `reference_frame` | world 기준 박스와 위치 |
 | `box_orientation_xyzw` | - | `frame_id`에서 본 박스 축의 방향 |
 | `gravity_aligned` | - | false면 TF 없이 센서 좌표계 기준으로 계산된 값 |
+| `track_id` | - | 프레임 간 동일 객체 ID. 확정 전이면 null. 추적을 끄면 필드 자체가 없다 |
 
-- `id`는 **프레임 내 식별자**로, 거리 오름차순으로 부여한다. 프레임 간 추적이 아니므로 같은 객체의 ID가 바뀔 수 있다.
+- `id`는 **프레임 내 식별자**로, 거리 오름차순으로 부여한다. 프레임 간 추적이 아니므로 같은 객체의 ID가 바뀔 수 있다. 프레임 간 동일 객체는 `track_id`로 식별한다.
+- `/lidar/objects/points`의 `object_id`와 마커 ID는 계속 `id`(프레임 내 식별자)다. 추적이 켜져 있으면 마커 색과 라벨(`T<track_id>`)만 `track_id`를 따르고, 확정 전 객체는 회색 `#id`로 표시된다.
+
+### 추적 (`track_id`)
+
+- 입력: 객체별 `center_reference`(world)와 프레임 `stamp_ns`. 예측에는 **실제 stamp 차이**를 쓴다(고정 주기 가정 없음). bag은 센서 시간 약 12 Hz가 느리게 재생되고 프레임이 빠질 수 있으므로 수신 간격이 아니라 stamp를 기준으로 한다.
+- 모델: 등속 칼만 필터 `[x, y, z, vx, vy, vz]`. 연결: 헝가리안 알고리즘(`scipy.optimize.linear_sum_assignment`), 비용은 `d² + ln|S|`, 마할라노비스 게이트와 최대 수평 거리 게이트를 함께 적용.
+- 수명: 새 트랙은 미확정, `min_hits`회 매칭되면 확정되어 `track_id`가 나온다. 검출이 끊겨도 `max_coast_s` 동안 예측 위치로 유지되며, 그 안에 재검출되면 같은 ID를 이어 붙인다. ID는 재사용하지 않는다.
+- 초기화: stamp가 뒤로 가거나(bag 재시작), 간격이 `max_gap_s`를 넘거나, `reference_frame`이 바뀌면(TF 상실) 모든 트랙을 버린다.
+- 한계: 한 물체가 프레임마다 1개/2개 클러스터로 바뀌면(빈 트럭, 텔레핸들러 붐) 조각마다 트랙이 생겨 GT 기준 ID가 번갈아 바뀐다. 클러스터링 단계의 분리 문제다.
 - 크레인 자체 구조물도 후보로 나온다(센서에서 약 2.7 m, S2·S7 표본 프레임에서 `id` 0). `id` 0을 가장 가까운 실제 객체로 간주하면 안 된다.
 
 ## YOLO 융합 담당자용 인터페이스
