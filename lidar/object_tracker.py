@@ -23,6 +23,11 @@ Resets:
     All tracks are dropped when the stamp goes backwards (bag restart), when
     the gap exceeds max_gap_s, or when the reference frame changes (e.g. TF
     lost: positions are then in the cloud frame and not comparable).
+State access (read-only, for velocity/TTC in object_motion.py):
+    After update(), last_tracks[k] is the Track (tentative or confirmed)
+    that detection k was assigned to, and coasting_tracks() lists the
+    confirmed tracks that were only predicted in this frame. Track exposes
+    velocity, its covariance, age and the last innovation (nis).
 """
 
 from dataclasses import dataclass
@@ -84,6 +89,8 @@ class Track:
         self.confirmed = params.min_hits <= 1
         self.first_stamp_ns = stamp_ns
         self.last_update_ns = stamp_ns
+        # Normalized innovation squared of the last update (d^2 of y).
+        self.nis = 0.0
 
     @property
     def position(self):
@@ -92,6 +99,19 @@ class Track:
     @property
     def velocity(self):
         return self.x[3:].copy()
+
+    @property
+    def velocity_covariance(self):
+        """(3, 3) covariance of velocity, in the reference frame."""
+        return self.P[3:, 3:].copy()
+
+    def age_s(self, stamp_ns):
+        """Time since the track was created, at stamp_ns."""
+        return (int(stamp_ns) - self.first_stamp_ns) * 1e-9
+
+    def since_update_s(self, stamp_ns):
+        """Time since the last measurement update, at stamp_ns."""
+        return (int(stamp_ns) - self.last_update_ns) * 1e-9
 
     def predict(self, dt, accel_std):
         F = np.eye(6)
@@ -112,7 +132,9 @@ class Track:
 
     def update(self, measurement, R, stamp_ns, min_hits):
         y, S = self.innovation(measurement, R)
-        K = self.P @ _H.T @ np.linalg.inv(S)
+        S_inv = np.linalg.inv(S)
+        self.nis = float(y @ S_inv @ y)
+        K = self.P @ _H.T @ S_inv
         self.x = self.x + K @ y
         # Joseph form keeps P symmetric positive definite.
         I_KH = np.eye(6) - K @ _H
@@ -137,6 +159,8 @@ class ObjectTracker:
         self.last_stamp_ns: Optional[int] = None
         self.reference_frame: Optional[str] = None
         self.resets = 0
+        # Track of each detection of the last update (None: none).
+        self.last_tracks: List[Optional[Track]] = []
 
     def reset(self):
         """Drops all tracks. IDs keep counting up, so none is reused."""
@@ -148,6 +172,13 @@ class ObjectTracker:
     @property
     def confirmed_tracks(self):
         return [t for t in self.tracks.values() if t.confirmed]
+
+    def coasting_tracks(self):
+        """Confirmed tracks not measured in the last update (predicted)."""
+        if self.last_stamp_ns is None:
+            return []
+        return [t for t in self.tracks.values()
+                if t.confirmed and t.last_update_ns != self.last_stamp_ns]
 
     def update(self, stamp_ns, positions, reference_frame=""):
         """Processes one frame.
@@ -181,9 +212,11 @@ class ObjectTracker:
         pairs = self._associate(track_list, positions, R)
 
         result: List[Optional[int]] = [None] * len(positions)
+        assigned: List[Optional[Track]] = [None] * len(positions)
         matched_tracks = set()
         for t_index, d_index in pairs:
             track = track_list[t_index]
+            assigned[d_index] = track
             track.update(positions[d_index], R, stamp_ns,
                          self.params.min_hits)
             matched_tracks.add(track.id)
@@ -206,8 +239,10 @@ class ObjectTracker:
                           self.params)
             self.tracks[track.id] = track
             self.next_id += 1
+            assigned[d_index] = track
             if track.confirmed:
                 result[d_index] = track.id
+        self.last_tracks = assigned
         return result
 
     def _associate(self, tracks, positions, R):

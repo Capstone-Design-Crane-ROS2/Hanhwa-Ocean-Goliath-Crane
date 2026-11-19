@@ -12,6 +12,15 @@ object, and markers keep their color per track. The frame-local id and the
 object_id field of the points cloud are unchanged.
 tracker.enabled:=false restores the untracked output exactly.
 
+Velocity and crane-face TTC (object_motion.py, crane_boundary.py, enabled
+with tracking by default): each object gets "motion" (Kalman velocity with
+a validity state) and "crane_boundary" (box distance to the crane face
+plane, closing speed, TTC or the reason there is none); the top level gets
+"motion_model", "crane_boundary_model" and "predicted_tracks" (confirmed
+tracks not detected in this frame, predicted only). The TTC is a
+first-order approach-risk indicator: plane boundary, crane assumed static.
+motion.enabled:=false restores the tracking-only output exactly.
+
 All outputs reuse the input header (stamp, frame_id). Every input frame gets
 outputs, also when empty or when processing fails, so a consumer can detect
 a real drop by a missing stamp.
@@ -50,7 +59,17 @@ from object_estimator import (
     estimate_objects,
     height_band_mask,
 )
+from crane_boundary import CraneState, PlaneBoundary, zones_from_flat
 from object_messages import frame_to_json, frame_to_markers, labeled_cloud
+from object_motion import (
+    MotionEstimator,
+    MotionParams,
+    TtcParams,
+    assess_boundary,
+    model_info,
+    motion_to_dict,
+    risk_to_dict,
+)
 from object_tracker import ObjectTracker, TrackerParams
 
 
@@ -65,10 +84,31 @@ TRACKER_PARAMS = (
     "max_gap_s",
 )
 
+MOTION_PARAMS = tuple(MotionParams.__dataclass_fields__)
+TTC_PARAMS = tuple(TtcParams.__dataclass_fields__)
+MOTION_INT_PARAMS = ("min_hits", "point_jump_min")
+
+# Crane contact face of the dataset (gt.json eval_frame, face "C": world x
+# = ox, outward +x). Scenario values, not a crane specification: set them
+# for the real crane.
+DEFAULT_FACE_POINT = (398.884, 0.052)
+DEFAULT_FACE_NORMAL = (1.0, 0.0)
+# Crane's own structure seen by the LiDAR in every bag: clusters 2-8 m
+# behind the face at 6-9 m height (incl. a 2.6 x 4.1 x 1.1 m part 2.7 m from
+# the sensor). Objects centered here are "excluded", not intrusions.
+# World [x0, y0, z0, x1, y1, z1]; dataset-derived like the face.
+DEFAULT_EXCLUSION_BOXES = [388.884, -35.0, 4.5, 398.884, 35.0, 12.0]
+
 STARTUP_ONLY = (
     "input_topic", "output_topic", "marker_topic", "points_topic",
     "world_frame", "ground_z_world",
 )
+
+
+def _non_negative(value, name):
+    if not np.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be finite and >= 0")
+    return value
 
 
 def stamp_to_ns(stamp):
@@ -124,8 +164,27 @@ class LidarObjectNode(Node):
             self.declare_parameter(
                 f"tracker.{name}", getattr(TrackerParams, name)
             )
+        self.declare_parameter("motion.enabled", True)
+        for name in MOTION_PARAMS:
+            self.declare_parameter(
+                f"motion.{name}", getattr(MotionParams, name)
+            )
+        for name in TTC_PARAMS:
+            self.declare_parameter(f"ttc.{name}", getattr(TtcParams, name))
+        self.declare_parameter("crane.face_point_x", DEFAULT_FACE_POINT[0])
+        self.declare_parameter("crane.face_point_y", DEFAULT_FACE_POINT[1])
+        self.declare_parameter("crane.face_normal_x", DEFAULT_FACE_NORMAL[0])
+        self.declare_parameter("crane.face_normal_y", DEFAULT_FACE_NORMAL[1])
+        self.declare_parameter("crane.velocity_x", 0.0)
+        self.declare_parameter("crane.velocity_y", 0.0)
+        self.declare_parameter("crane.exclusion_enabled", True)
+        self.declare_parameter("crane.exclusion_boxes",
+                               DEFAULT_EXCLUSION_BOXES)
+        self.declare_parameter("marker.show_motion", True)
+        self.declare_parameter("marker.velocity_arrow_s", 1.0)
 
         self.tracker = None
+        self.motion = None
         self._apply_settings(self._read_settings())
         self.add_on_set_parameters_callback(self._on_set_parameters)
 
@@ -167,7 +226,10 @@ class LidarObjectNode(Node):
         self.cluster_ms = []
         self.estimate_ms = []
         self.track_ms = []
+        self.motion_ms = []
         self.total_ms = []
+        self.ttc_status = {}
+        self.motion_states = {}
 
         self.get_logger().info(
             f"Object node started: {input_topic} -> {output_topic}, "
@@ -210,6 +272,29 @@ class LidarObjectNode(Node):
                 )
                 for name in TRACKER_PARAMS
             }),
+            "motion_enabled": bool(value("motion.enabled")),
+            "motion": MotionParams(**{
+                name: (int if name in MOTION_INT_PARAMS else float)(
+                    value(f"motion.{name}")
+                )
+                for name in MOTION_PARAMS
+            }),
+            "ttc": TtcParams(**{
+                name: float(value(f"ttc.{name}")) for name in TTC_PARAMS
+            }),
+            "boundary": PlaneBoundary(
+                (float(value("crane.face_point_x")),
+                 float(value("crane.face_point_y"))),
+                (float(value("crane.face_normal_x")),
+                 float(value("crane.face_normal_y"))),
+            ),
+            "crane": CraneState((float(value("crane.velocity_x")),
+                                 float(value("crane.velocity_y")))),
+            "zones": (zones_from_flat(value("crane.exclusion_boxes"))
+                      if bool(value("crane.exclusion_enabled")) else []),
+            "show_motion": bool(value("marker.show_motion")),
+            "arrow_s": _non_negative(float(value("marker.velocity_arrow_s")),
+                                     "marker.velocity_arrow_s"),
         }
 
     def _apply_settings(self, settings):
@@ -224,6 +309,20 @@ class LidarObjectNode(Node):
         else:
             # Keeps the current tracks; new values apply from the next frame.
             self.tracker.params = settings["tracker"]
+        # Motion needs tracks; a new tracker also starts a new estimator.
+        if self.tracker is None or not settings["motion_enabled"]:
+            self.motion = None
+        elif self.motion is None or self.motion_tracker is not self.tracker:
+            self.motion = MotionEstimator(settings["motion"])
+        else:
+            self.motion.params = settings["motion"]
+        self.motion_tracker = self.tracker
+        self.ttc_params = settings["ttc"]
+        self.boundary = settings["boundary"]
+        self.crane = settings["crane"]
+        self.zones = settings["zones"]
+        self.show_motion = settings["show_motion"]
+        self.arrow_s = settings["arrow_s"]
 
     def _settings_text(self):
         cluster = self.extractor.params
@@ -234,7 +333,20 @@ class LidarObjectNode(Node):
             f"crop={self.crop}m center={estimate.center_method} "
             f"max_footprint={estimate.max_footprint}m "
             f"max_height={estimate.max_height}m "
-            f"tracking={self._tracker_text()}"
+            f"tracking={self._tracker_text()} "
+            f"motion={self._motion_text()}"
+        )
+
+    def _motion_text(self):
+        if self.motion is None:
+            return "off"
+        face = self.boundary.describe()
+        return (
+            f"on(face={face['point_xy']} normal={face['normal_xy']} "
+            f"margin={self.ttc_params.safety_margin_m}m "
+            f"max_ttc={self.ttc_params.max_ttc_s}s "
+            f"exclusion_zones={len(self.zones)} "
+            f"crane={'static' if self.crane.static else 'moving'})"
         )
 
     def _tracker_text(self):
@@ -285,9 +397,11 @@ class LidarObjectNode(Node):
             return None
 
     def process(self, msg):
-        """Returns (points, ObjectFrame, track_ids) for one input message.
+        """Returns (points, ObjectFrame, track_ids, motion) for one message.
 
-        track_ids is None when tracking is disabled.
+        track_ids is None when tracking is disabled; motion is None when
+        motion is disabled, else (object_extras, frame_extras,
+        motion_markers).
         """
         points = cloud_to_xyz(msg)
         pose = self.lookup_pose(msg.header.frame_id)
@@ -334,14 +448,86 @@ class LidarObjectNode(Node):
                 frame.reference_frame,
             )
             self.track_ms.append((time.perf_counter() - start) * 1e3)
-        return points, frame, track_ids
+
+        motion = None
+        if self.motion is not None:
+            start = time.perf_counter()
+            motion = self.motion_outputs(frame, pose)
+            self.motion_ms.append((time.perf_counter() - start) * 1e3)
+        return points, frame, track_ids, motion
+
+    def motion_outputs(self, frame, pose):
+        """Velocity validity, boundary distance and TTC of a tracked frame.
+
+        Returns (object_extras, frame_extras, motion_markers).
+        """
+        world = frame.gravity_aligned
+        stamp = frame.stamp_ns
+        motions = self.motion.update(self.tracker, stamp, frame.objects,
+                                     world)
+        extras, markers = [], []
+        for obj, motion in zip(frame.objects, motions):
+            risk = assess_boundary(
+                motion, obj.bbox_min, obj.bbox_max, obj.center_reference,
+                self.boundary, self.ttc_params, self.crane, self.zones,
+                world,
+            )
+            self._count(motion.state, risk.status)
+            extras.append({"motion": motion_to_dict(motion),
+                           "crane_boundary": risk_to_dict(risk)})
+            markers.append(self._motion_marker(obj, motion, risk, pose))
+
+        predicted = []
+        for track, motion in self.motion.predicted(self.tracker, stamp,
+                                                   world):
+            center = track.position
+            half = self.motion.last_size(track.id)
+            half = np.zeros(2) if half is None else half / 2.0
+            box_min = np.concatenate([center[:2] - half, center[2:]])
+            box_max = np.concatenate([center[:2] + half, center[2:]])
+            risk = assess_boundary(
+                motion, box_min, box_max, center, self.boundary,
+                self.ttc_params, self.crane, self.zones, world,
+            )
+            predicted.append({
+                "track_id": track.id,
+                "center_reference": np.round(center, 3).tolist(),
+                "since_update_s": round(motion.since_update_s, 3),
+                "motion": motion_to_dict(motion),
+                "crane_boundary": risk_to_dict(risk),
+            })
+        frame_extras = model_info(self.boundary, self.motion.params,
+                                  self.ttc_params, self.crane, self.zones,
+                                  frame.reference_frame)
+        frame_extras["predicted_tracks"] = predicted
+        return extras, frame_extras, markers
+
+    def _count(self, state, status):
+        self.motion_states[state] = self.motion_states.get(state, 0) + 1
+        self.ttc_status[status] = self.ttc_status.get(status, 0) + 1
+
+    def _motion_marker(self, obj, motion, risk, pose):
+        """Arrow and text for moving objects (and any valid TTC)."""
+        if not self.show_motion or motion.state != "moving":
+            return None
+        velocity = np.array([motion.velocity[0], motion.velocity[1], 0.0])
+        tip = obj.center_reference + velocity * self.arrow_s
+        text = f"{motion.speed:.1f}m/s"
+        if risk.status == "valid":
+            text += f" TTC {risk.ttc:.1f}s"
+        return {
+            "arrow_end": (pose.to_cloud(tip[None])[0]
+                          if self.arrow_s > 0 else None),
+            "text": text,
+            "alert": risk.status == "valid",
+        }
 
     def callback(self, msg):
         start = time.perf_counter()
         self.received += 1
 
         try:
-            points, frame, track_ids = self.process(msg)
+            points, frame, track_ids, motion = self.process(msg)
         except Exception as exc:
             # Keep the frame visible downstream as an empty result.
             self.failed += 1
@@ -358,13 +544,22 @@ class LidarObjectNode(Node):
             # The tracker did not see this frame; the next real stamp
             # difference covers the gap.
             track_ids = None if self.tracker is None else []
+            motion = None
+            if self.motion is not None:
+                info = model_info(self.boundary, self.motion.params,
+                                  self.ttc_params, self.crane, self.zones,
+                                  frame.reference_frame)
+                info["predicted_tracks"] = []
+                motion = ([], info, [])
 
+        object_extras, frame_extras, motion_markers = motion or (
+            None, None, None)
         self.object_publisher.publish(String(
-            data=frame_to_json(frame, track_ids)
+            data=frame_to_json(frame, track_ids, object_extras, frame_extras)
         ))
         self.marker_publisher.publish(frame_to_markers(
             msg.header, frame.objects, show_labels=self.show_labels,
-            track_ids=track_ids,
+            track_ids=track_ids, motion_markers=motion_markers,
         ))
         self.points_publisher.publish(
             labeled_cloud(msg.header, points, frame.objects)
@@ -409,8 +604,14 @@ class LidarObjectNode(Node):
             f"cluster {self._timing(self.cluster_ms)}, "
             f"estimate {self._timing(self.estimate_ms)}, "
             f"track {self._timing(self.track_ms)}, "
+            f"motion {self._timing(self.motion_ms)}, "
             f"total {self._timing(self.total_ms)}"
         )
+        if self.motion is not None:
+            self.get_logger().info(
+                f"Motion stats: states={self.motion_states}, "
+                f"ttc_status={self.ttc_status}"
+            )
         if self.tracker is not None:
             self.get_logger().info(
                 f"Tracker stats: tracks_created={self.tracker.next_id}, "

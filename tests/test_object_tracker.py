@@ -188,5 +188,72 @@ class ResetTest(unittest.TestCase):
         np.testing.assert_array_equal(tracker.tracks[0].P, before)
 
 
+class StateAccessTest(unittest.TestCase):
+    """Read-only state used by object_motion.py; IDs are unaffected."""
+
+    def test_last_tracks_follow_detections(self):
+        tracker = ObjectTracker()
+        frames = [[[10.0, 0.0, 1.0], [0.0, 10.0, 1.0]]] * 4
+        ids = run(tracker, frames)[-1]
+        self.assertEqual(len(tracker.last_tracks), 2)
+        for tid, track in zip(ids, tracker.last_tracks):
+            self.assertEqual(track.id, tid)
+        # Swapped order: the same tracks, in the new detection order.
+        swapped = tracker.update(4 * PERIOD_NS,
+                                 [[0.0, 10.0, 1.0], [10.0, 0.0, 1.0]],
+                                 "world")
+        self.assertEqual(swapped, ids[::-1])
+        self.assertEqual([t.id for t in tracker.last_tracks], ids[::-1])
+
+    def test_last_tracks_include_tentative(self):
+        tracker = ObjectTracker()
+        ids = tracker.update(0, [[1.0, 0.0, 0.0]], "world")
+        self.assertEqual(ids, [None])
+        self.assertFalse(tracker.last_tracks[0].confirmed)
+        self.assertEqual(tracker.update(PERIOD_NS, [], "world"), [])
+        self.assertEqual(tracker.last_tracks, [])
+
+    def test_ids_unchanged_by_state_access(self):
+        a, b = ObjectTracker(), ObjectTracker()
+        frames = [[[k * 0.1, 0.0, 1.0], [5.0, k * 0.2, 1.0]]
+                  for k in range(10)]
+        ids_a = run(a, frames)
+        ids_b = []
+        for k, positions in enumerate(frames):
+            ids_b.append(b.update(k * PERIOD_NS, positions, "world"))
+            b.coasting_tracks()
+            [t.velocity_covariance for t in b.last_tracks if t]
+        self.assertEqual(ids_a, ids_b)
+
+    def test_coasting_tracks(self):
+        tracker = ObjectTracker()
+        run(tracker, [[[10.0, 0.0, 1.0]]] * 4)
+        self.assertEqual(tracker.coasting_tracks(), [])
+        tracker.update(4 * PERIOD_NS, [], "world")
+        coasting = tracker.coasting_tracks()
+        self.assertEqual([t.id for t in coasting], [0])
+        self.assertAlmostEqual(coasting[0].since_update_s(4 * PERIOD_NS),
+                               PERIOD_NS * 1e-9)
+
+    def test_velocity_covariance_and_age(self):
+        tracker = ObjectTracker()
+        run(tracker, [[[k * 0.2, 0.0, 1.0]] for k in range(12)])
+        track = tracker.tracks[0]
+        cov = track.velocity_covariance
+        self.assertEqual(cov.shape, (3, 3))
+        np.testing.assert_allclose(cov, cov.T)
+        self.assertTrue(np.all(np.linalg.eigvalsh(cov) > 0))
+        self.assertLess(cov[0, 0], TrackerParams().init_vel_std ** 2)
+        self.assertAlmostEqual(track.age_s(11 * PERIOD_NS),
+                               11 * PERIOD_NS * 1e-9)
+
+    def test_nis_reflects_innovation(self):
+        tracker = ObjectTracker()
+        run(tracker, [[[0.0, 0.0, 1.0]]] * 10)
+        small = tracker.tracks[0].nis
+        tracker.update(10 * PERIOD_NS, [[0.8, 0.0, 1.0]], "world")
+        self.assertGreater(tracker.tracks[0].nis, small)
+
+
 if __name__ == "__main__":
     unittest.main()

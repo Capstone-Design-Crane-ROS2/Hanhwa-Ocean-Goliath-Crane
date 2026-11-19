@@ -6,6 +6,11 @@ docs/lidar_object_estimation.md.
 Tracking is optional: when track_ids are given, each JSON object gets a
 "track_id" (int, or null before its track is confirmed) and markers are
 colored and labeled by track ID. Without track_ids the output is unchanged.
+
+Motion/TTC is optional too: object_extras (one dict per object) and
+frame_extras (one dict) are merged into the JSON as additional keys, and
+motion_markers adds velocity arrows and a speed/TTC text per object in
+their own namespaces. Without them the output is unchanged.
 """
 
 import array
@@ -88,13 +93,26 @@ def _track_list(track_ids, objects):
     return list(track_ids)
 
 
-def frame_to_json(frame, track_ids=None):
+def frame_to_json(frame, track_ids=None, object_extras=None,
+                  frame_extras=None):
     """ObjectFrame -> JSON text for /lidar/objects.
 
     track_ids: optional, one track ID (or None) per frame.objects entry.
+    object_extras: optional, one dict per object, added to its JSON object.
+    frame_extras: optional dict added at the top level.
+    Existing keys are never replaced.
     """
     tracks = _track_list(track_ids, frame.objects)
-    return json.dumps({
+    objects = [
+        object_to_dict(obj, track)
+        for obj, track in zip(frame.objects, tracks)
+    ]
+    if object_extras is not None:
+        if len(object_extras) != len(objects):
+            raise ValueError("object_extras must have one entry per object")
+        for data, extra in zip(objects, object_extras):
+            _merge_new(data, extra)
+    data = {
         "schema": OBJECT_SCHEMA,
         "stamp_ns": frame.stamp_ns,
         "frame_id": frame.frame_id,
@@ -102,11 +120,17 @@ def frame_to_json(frame, track_ids=None):
         "gravity_aligned": frame.gravity_aligned,
         "box_orientation_xyzw": _rounded(frame.box_orientation_xyzw, 6),
         "object_count": len(frame.objects),
-        "objects": [
-            object_to_dict(obj, track)
-            for obj, track in zip(frame.objects, tracks)
-        ],
-    })
+        "objects": objects,
+    }
+    _merge_new(data, frame_extras or {})
+    return json.dumps(data)
+
+
+def _merge_new(data, extra):
+    for key, value in extra.items():
+        if key in data:
+            raise ValueError(f"extra key {key!r} would replace a field")
+        data[key] = value
 
 
 def labeled_cloud(header, points, objects):
@@ -200,16 +224,63 @@ def _label_marker(header, obj, text_height, color, prefix):
     return marker
 
 
+def _arrow_marker(header, obj, start, end, color, line_width):
+    marker = Marker()
+    marker.header = header
+    marker.ns = "object_velocity"
+    marker.id = obj.id
+    marker.type = Marker.ARROW
+    marker.action = Marker.ADD
+    marker.pose.orientation.w = 1.0
+    marker.scale.x = line_width * 2      # shaft diameter
+    marker.scale.y = line_width * 4      # head diameter
+    marker.scale.z = line_width * 6      # head length
+    marker.color = color
+    marker.points = [
+        Point(x=float(start[0]), y=float(start[1]), z=float(start[2])),
+        Point(x=float(end[0]), y=float(end[1]), z=float(end[2])),
+    ]
+    return marker
+
+
+def _motion_text_marker(header, obj, text, text_height, color):
+    """Second text line, above the object label (namespace object_motion)."""
+    marker = _label_marker(header, obj, text_height, color, "")
+    marker.ns = "object_motion"
+    up = obj.corners[4] - obj.corners[0]
+    length = np.linalg.norm(up)
+    if length > 1e-6:
+        shift = up / length * text_height * 1.2
+        marker.pose.position.x += float(shift[0])
+        marker.pose.position.y += float(shift[1])
+        marker.pose.position.z += float(shift[2])
+    marker.scale.z = text_height * 0.8
+    marker.text = text
+    return marker
+
+
+ALERT_COLOR = (1.0, 0.25, 0.1)
+
+
 def frame_to_markers(header, objects, line_width=0.05, text_height=0.6,
-                     show_labels=True, track_ids=None):
+                     show_labels=True, track_ids=None, motion_markers=None):
     """MarkerArray with one wireframe box and label per object.
 
     The first marker is DELETEALL, so boxes of the previous frame never
     remain when the object count drops; an empty frame clears the display.
     Marker IDs stay obj.id. With track_ids, a tracked object keeps its color
     across frames and is labeled "T<track_id>"; unconfirmed ones are gray.
+
+    motion_markers: optional, one dict (or None) per object with
+        "arrow_end": (3,) arrow tip in the cloud frame, or None (no arrow;
+            the arrow starts at obj.center), namespace object_velocity
+        "text": second text line (speed, TTC), or None, namespace
+            object_motion
+        "alert": True colors the arrow and text as an approach alert
     """
     tracks = _track_list(track_ids, objects)
+    if motion_markers is not None and len(motion_markers) != len(objects):
+        raise ValueError("motion_markers must have one entry per object")
     clear = Marker()
     clear.header = header
     clear.action = Marker.DELETEALL
@@ -222,4 +293,29 @@ def frame_to_markers(header, objects, line_width=0.05, text_height=0.6,
             markers.append(
                 _label_marker(header, obj, text_height, color, prefix)
             )
+    if motion_markers is not None:
+        markers.extend(_motion_markers(
+            header, objects, tracks, motion_markers, line_width,
+            text_height, show_labels,
+        ))
     return MarkerArray(markers=markers)
+
+
+def _motion_markers(header, objects, tracks, motion_markers, line_width,
+                    text_height, show_labels):
+    out = []
+    for obj, track, motion in zip(objects, tracks, motion_markers):
+        if not motion:
+            continue
+        color, _ = _marker_style(obj, track)
+        if motion.get("alert"):
+            r, g, b = ALERT_COLOR
+            color = ColorRGBA(r=r, g=g, b=b, a=1.0)
+        if motion.get("arrow_end") is not None:
+            out.append(_arrow_marker(header, obj, obj.center,
+                                     motion["arrow_end"], color,
+                                     line_width))
+        if show_labels and motion.get("text"):
+            out.append(_motion_text_marker(header, obj, motion["text"],
+                                           text_height, color))
+    return out
