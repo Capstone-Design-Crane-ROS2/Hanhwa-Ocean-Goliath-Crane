@@ -11,7 +11,15 @@ Output contract (consumed by lidar_roi_node.py):
                      point count
 
 A camera frame whose scans are missing is skipped; no other scan is
-substituted. Merging runs synchronously in the subscription callback
+substituted.
+
+scan_offsets (default [-1, 0, 1]) lists the scans to merge as multiples of
+scan_period_ms around the camera stamp. Sensors that publish one full 360°
+scan per message (2nd dataset 2026-11-22: one scan per 100 ms, camera at
+30 Hz with one camera frame at the scan stamp) use scan_offsets:=[0]: each
+scan is published once, paired with the camera frame of the same stamp; the
+other camera frames have no scan and are counted as skipped (log_skips:=false
+keeps them out of the log). Merging runs synchronously in the subscription callback
 (~10-15 ms per frame), so there is no work queue to overflow.
 """
 
@@ -131,6 +139,15 @@ class LidarMerger(Node):
         self.declare_parameter("scan_period_ms", 33.333333)
         self.declare_parameter("tolerance_ms", 2.0)
         self.declare_parameter("max_camera_wait_ms", 500.0)
+        self.declare_parameter("scan_offsets", [-1, 0, 1])
+        self.declare_parameter("log_skips", True)
+
+        self.offsets = sorted(
+            int(k) for k in self.get_parameter("scan_offsets").value
+        )
+        if not self.offsets or len(set(self.offsets)) != len(self.offsets):
+            raise ValueError("scan_offsets must be non-empty and unique")
+        self.log_skips = bool(self.get_parameter("log_skips").value)
 
         self.period_ns = round(
             self.get_parameter("scan_period_ms").value * 1e6
@@ -256,7 +273,7 @@ class LidarMerger(Node):
 
             selected = [
                 self.find_scan(camera_stamp + k * self.period_ns)
-                for k in (-1, 0, 1)
+                for k in self.offsets
             ]
 
             if None not in selected:
@@ -271,7 +288,8 @@ class LidarMerger(Node):
                 # Camera arrived too late; its scans may be evicted.
                 reason = "skip_timeout"
             elif latest > (
-                camera_stamp + self.period_ns + self.tolerance_ns
+                camera_stamp + self.offsets[-1] * self.period_ns
+                + self.tolerance_ns
             ):
                 # A later scan already arrived, so a required scan is
                 # absent. Do not substitute a neighboring scan.
@@ -281,10 +299,11 @@ class LidarMerger(Node):
 
             self.pending_cameras.popleft()
             self.counts[reason] += 1
-            self.get_logger().warn(
-                f"{reason}: camera {camera_stamp}, "
-                f"scans {selected}"
-            )
+            if self.log_skips:
+                self.get_logger().warn(
+                    f"{reason}: camera {camera_stamp}, "
+                    f"scans {selected}"
+                )
 
         self.evict()
 
@@ -295,14 +314,14 @@ class LidarMerger(Node):
         oldest_needed = (
             self.last_lidar_stamp
             - self.max_wait_ns
-            - self.period_ns
+            + self.offsets[0] * self.period_ns
             - self.tolerance_ns
         )
         if self.pending_cameras:
             oldest_needed = min(
                 oldest_needed,
                 self.pending_cameras[0]
-                - self.period_ns
+                + self.offsets[0] * self.period_ns
                 - self.tolerance_ns,
             )
 
