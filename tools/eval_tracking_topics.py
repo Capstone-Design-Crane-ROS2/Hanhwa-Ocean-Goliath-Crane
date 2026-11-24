@@ -33,21 +33,31 @@ from std_msgs.msg import String
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lidar"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from eval_objects_gt import gt_boxes, inside_box  # noqa: E402
+from eval_objects_gt import (  # noqa: E402
+    GT_FRAME_MODES, gt_boxes, inside_box, select_gt_frames,
+)
 from eval_tracking_gt import summarize_object  # noqa: E402
 
 
 MARGIN = 0.5
 
 
-def read_gt(bag_dir):
+def read_gt(bag_dir, gt_frames="camera"):
+    """({last LiDAR stamp: GT frame}, gt.json scene) of a bag.
+
+    gt_frames "camera" (default, previous behavior, used by
+    tools/eval_risk_gt.py): every MEASURING GT frame keyed by its last LiDAR
+    stamp, a later frame of the same stamp replacing an earlier one.
+    "scan": one GT frame per scan with boxes at the scan stamp
+    (eval_objects_gt.select_gt_frames).
+    """
     db = sqlite3.connect(
         f"file:{bag_dir}/bag/bag_0.db3?mode=ro&immutable=1", uri=True
     )
     topic = db.execute(
         "select id from topics where name='/eval/ground_truth'"
     ).fetchone()[0]
-    frames = {}
+    gts = []
     for (data,) in db.execute(
         "select data from messages where topic_id=? order by timestamp",
         (topic,),
@@ -55,9 +65,13 @@ def read_gt(bag_dir):
         gt = json.loads(deserialize_message(data, String).data)
         if (gt.get("measurement_state") == "MEASURING"
                 and gt.get("lidar_stamps_ns")):
-            frames[gt["lidar_stamps_ns"][-1]] = gt
+            gts.append(gt)
     with open(Path(bag_dir) / "gt.json", encoding="utf8") as handle:
         scene = json.load(handle)
+    gts, _ = select_gt_frames(gts, scene, gt_frames)
+    frames = {}
+    for gt in gts:
+        frames[gt["lidar_stamps_ns"][-1]] = gt
     return frames, scene
 
 
@@ -136,11 +150,15 @@ def main():
     parser.add_argument("report")
     parser.add_argument("bag_dir")
     parser.add_argument("--json")
+    parser.add_argument("--gt-frames", choices=GT_FRAME_MODES,
+                        default="scan",
+                        help="GT frames (default: one per LiDAR scan; "
+                             "camera = previous behavior)")
     args = parser.parse_args()
 
     with open(args.report, encoding="utf8") as handle:
         report = json.load(handle)
-    gt_frames, scene = read_gt(args.bag_dir)
+    gt_frames, scene = read_gt(args.bag_dir, args.gt_frames)
     result = evaluate(report, gt_frames, scene)
     summary = {k: v for k, v in result.items() if k != "objects"}
     print(json.dumps(summary))
