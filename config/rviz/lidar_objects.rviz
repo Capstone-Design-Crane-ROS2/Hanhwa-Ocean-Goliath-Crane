@@ -99,6 +99,8 @@ Visualization Manager:
       Namespaces:
         object_box: true
         object_label: true
+        object_motion: true
+        object_velocity: true
       Topic:
         Depth: 10
         Durability Policy: Volatile

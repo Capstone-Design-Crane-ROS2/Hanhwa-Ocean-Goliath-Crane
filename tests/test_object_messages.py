@@ -147,5 +147,134 @@ class MarkerTest(unittest.TestCase):
         self.assertEqual(len(markers), 3)
 
 
+class TrackIdTest(unittest.TestCase):
+    def test_json_without_tracking_has_no_track_id(self):
+        _, objects = make_objects()
+        data = json.loads(frame_to_json(make_frame(objects)))
+        for item in data["objects"]:
+            self.assertNotIn("track_id", item)
+
+    def test_json_track_ids_and_null(self):
+        _, objects = make_objects()
+        data = json.loads(frame_to_json(make_frame(objects), [7, None]))
+        self.assertEqual([o["id"] for o in data["objects"]], [0, 1])
+        self.assertEqual([o["track_id"] for o in data["objects"]],
+                         [7, None])
+
+    def test_json_rest_unchanged_by_tracking(self):
+        _, objects = make_objects()
+        plain = json.loads(frame_to_json(make_frame(objects)))
+        tracked = json.loads(frame_to_json(make_frame(objects), [3, 4]))
+        for item in tracked["objects"]:
+            del item["track_id"]
+        self.assertEqual(plain, tracked)
+
+    def test_track_ids_length_checked(self):
+        _, objects = make_objects()
+        with self.assertRaises(ValueError):
+            frame_to_json(make_frame(objects), [1])
+
+    def test_markers_follow_track_id(self):
+        _, objects = make_objects()
+        plain = frame_to_markers(HEADER, objects).markers
+        tracked = frame_to_markers(HEADER, objects, track_ids=[9, None])
+        boxes = [m for m in tracked.markers if m.ns == "object_box"]
+        labels = [m for m in tracked.markers if m.ns == "object_label"]
+        # Marker IDs stay the frame-local ids.
+        self.assertEqual([m.id for m in boxes], [0, 1])
+        self.assertEqual(labels[0].text, f"T9 {objects[0].distance:.1f}m")
+        self.assertEqual(labels[1].text, f"#1 {objects[1].distance:.1f}m")
+        # Track 9 has the color object 9 would have; untracked is gray.
+        reference = frame_to_markers(HEADER, objects, track_ids=[9, 9])
+        self.assertEqual(boxes[0].color, reference.markers[1].color)
+        self.assertEqual(boxes[1].color.r, boxes[1].color.g)
+        self.assertNotEqual(boxes[0].color, plain[1].color)
+
+
+class MotionExtrasTest(unittest.TestCase):
+    """Optional motion/TTC fields; without them nothing changes."""
+
+    def test_json_unchanged_without_extras(self):
+        _, objects = make_objects()
+        frame = make_frame(objects)
+        ids = list(range(len(objects)))
+        self.assertEqual(frame_to_json(frame, ids),
+                         frame_to_json(frame, ids, None, None))
+
+    def test_extras_are_added(self):
+        _, objects = make_objects()
+        frame = make_frame(objects)
+        extras = [{"motion": {"state": "moving"},
+                   "crane_boundary": {"ttc_s": None}} for _ in objects]
+        data = json.loads(frame_to_json(
+            frame, list(range(len(objects))), extras,
+            {"crane_boundary_model": {"boundary": {"type": "plane"}},
+             "predicted_tracks": []},
+        ))
+        self.assertEqual(data["schema"], OBJECT_SCHEMA)
+        self.assertEqual(data["objects"][0]["motion"]["state"], "moving")
+        self.assertIsNone(data["objects"][0]["crane_boundary"]["ttc_s"])
+        self.assertEqual(data["predicted_tracks"], [])
+        # Existing fields keep their values.
+        plain = json.loads(frame_to_json(frame, list(range(len(objects)))))
+        for key, value in plain["objects"][0].items():
+            self.assertEqual(data["objects"][0][key], value)
+
+    def test_extras_cannot_replace_fields(self):
+        _, objects = make_objects()
+        frame = make_frame(objects)
+        with self.assertRaises(ValueError):
+            frame_to_json(frame, None, [{"distance_m": 0.0}] * len(objects))
+        with self.assertRaises(ValueError):
+            frame_to_json(frame, None, None, {"stamp_ns": 0})
+        with self.assertRaises(ValueError):
+            frame_to_json(frame, None, [{}])
+
+    def test_markers_unchanged_without_motion(self):
+        _, objects = make_objects()
+        a = frame_to_markers(HEADER, objects, track_ids=[0, 1])
+        b = frame_to_markers(HEADER, objects, track_ids=[0, 1],
+                             motion_markers=[None, None])
+        self.assertEqual(len(a.markers), len(b.markers))
+
+    def test_motion_markers(self):
+        _, objects = make_objects()
+        tip = objects[0].center + np.array([1.0, 0.0, 0.0])
+        markers = frame_to_markers(
+            HEADER, objects, track_ids=[3, None],
+            motion_markers=[{"arrow_end": tip, "text": "2.0m/s TTC 4.1s",
+                             "alert": True}, None],
+        ).markers
+        self.assertEqual(markers[0].action, Marker.DELETEALL)
+        arrows = [m for m in markers if m.ns == "object_velocity"]
+        texts = [m for m in markers if m.ns == "object_motion"]
+        self.assertEqual(len(arrows), 1)
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(arrows[0].type, Marker.ARROW)
+        self.assertEqual(arrows[0].id, objects[0].id)
+        self.assertAlmostEqual(arrows[0].points[1].x, float(tip[0]))
+        self.assertEqual(texts[0].text, "2.0m/s TTC 4.1s")
+        self.assertGreater(arrows[0].color.r, 0.9)   # alert color
+        labels = [m for m in markers if m.ns == "object_label"]
+        self.assertGreater(texts[0].pose.position.z,
+                           labels[0].pose.position.z - 1e-9)
+        # Existing box and label markers are still there.
+        self.assertEqual(
+            len([m for m in markers if m.ns == "object_box"]), 2)
+
+    def test_motion_text_follows_show_labels(self):
+        _, objects = make_objects()
+        markers = frame_to_markers(
+            HEADER, objects, show_labels=False, track_ids=[0, 1],
+            motion_markers=[{"arrow_end": None, "text": "x"}, None],
+        ).markers
+        self.assertFalse([m for m in markers if m.ns == "object_motion"])
+
+    def test_motion_markers_length_checked(self):
+        with self.assertRaises(ValueError):
+            frame_to_markers(HEADER, make_objects()[1],
+                             motion_markers=[None])
+
+
 if __name__ == "__main__":
     unittest.main()
