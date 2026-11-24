@@ -11,8 +11,30 @@ Output contract (consumed by lidar_roi_node.py):
                      point count
 
 A camera frame whose scans are missing is skipped; no other scan is
-substituted. Merging runs synchronously in the subscription callback
+substituted.
+
+scan_offsets (default [-1, 0, 1]) lists the scans to merge as multiples of
+scan_period_ms around the camera stamp. Sensors that publish one full 360°
+scan per message (2nd dataset 2026-11-22: one scan per 100 ms, camera at
+30 Hz with one camera frame at the scan stamp) use scan_offsets:=[0]: each
+scan is published once, paired with the camera frame of the same stamp; the
+other camera frames have no scan and are counted as skipped (log_skips:=false
+keeps them out of the log). Merging runs synchronously in the subscription callback
 (~10-15 ms per frame), so there is no work queue to overflow.
+
+camera_trigger (default true) keeps the camera-triggered behavior above.
+camera_trigger:=false is allowed only with scan_offsets:=[0] (one full scan
+per message): every scan is published on arrival, once, with its own stamp
+and frame_id, whether or not a camera frame exists for it. The camera then
+only decides /lidar/merge_sync: a camera frame within tolerance_ms of a
+published scan gets the usual message (camera stamp, [scan stamp], point
+count), in whichever order the two arrive; a scan without a camera frame
+gets none (no stamp is invented). In the 2nd dataset the bag misses some
+camera frames, and with camera_trigger:=true the scans at those instants
+were dropped (S08: 47 of 285).
+Counts in this mode: published, sync_published, scan_no_camera (published
+scan that never got a camera frame), camera_no_scan (camera frame without a
+scan), plus dup_lidar / dup_camera / reset as in the default mode.
 """
 
 import array
@@ -131,6 +153,23 @@ class LidarMerger(Node):
         self.declare_parameter("scan_period_ms", 33.333333)
         self.declare_parameter("tolerance_ms", 2.0)
         self.declare_parameter("max_camera_wait_ms", 500.0)
+        self.declare_parameter("scan_offsets", [-1, 0, 1])
+        self.declare_parameter("log_skips", True)
+
+        self.offsets = sorted(
+            int(k) for k in self.get_parameter("scan_offsets").value
+        )
+        if not self.offsets or len(set(self.offsets)) != len(self.offsets):
+            raise ValueError("scan_offsets must be non-empty and unique")
+        self.log_skips = bool(self.get_parameter("log_skips").value)
+        self.declare_parameter("camera_trigger", True)
+        self.camera_trigger = bool(
+            self.get_parameter("camera_trigger").value
+        )
+        if not self.camera_trigger and self.offsets != [0]:
+            raise ValueError(
+                "camera_trigger:=false requires scan_offsets:=[0]"
+            )
 
         self.period_ns = round(
             self.get_parameter("scan_period_ms").value * 1e6
@@ -173,6 +212,9 @@ class LidarMerger(Node):
         # because backwards timestamps reset the buffers.
         self.scans = OrderedDict()
         self.pending_cameras = deque()
+        # camera_trigger:=false only: published scan stamp -> point count,
+        # or None once a camera frame was paired with it.
+        self.published = OrderedDict()
 
         self.last_lidar_stamp = None
         self.last_camera_stamp = None
@@ -195,6 +237,8 @@ class LidarMerger(Node):
 
         self.scans.clear()
         self.pending_cameras.clear()
+        self.count_unpaired_scans(self.published)
+        self.published.clear()
         self.last_lidar_stamp = None
         self.last_camera_stamp = None
         self.frame_id = None
@@ -217,10 +261,13 @@ class LidarMerger(Node):
 
         self.frame_id = msg.header.frame_id
         self.last_lidar_stamp = stamp
-        self.scans[stamp] = ScanEntry(msg)
         self.counts["lidar_in"] += 1
 
-        self.process()
+        if self.camera_trigger:
+            self.scans[stamp] = ScanEntry(msg)
+            self.process()
+        else:
+            self.publish_scan(stamp, msg)
         self.callback_ms.append((time.perf_counter() - start) * 1e3)
 
     def camera_callback(self, msg):
@@ -238,7 +285,10 @@ class LidarMerger(Node):
         self.pending_cameras.append(stamp)
         self.counts["camera_in"] += 1
 
-        self.process()
+        if self.camera_trigger:
+            self.process()
+        else:
+            self.pair_cameras()
         self.callback_ms.append((time.perf_counter() - start) * 1e3)
 
     def find_scan(self, target):
@@ -256,7 +306,7 @@ class LidarMerger(Node):
 
             selected = [
                 self.find_scan(camera_stamp + k * self.period_ns)
-                for k in (-1, 0, 1)
+                for k in self.offsets
             ]
 
             if None not in selected:
@@ -271,7 +321,8 @@ class LidarMerger(Node):
                 # Camera arrived too late; its scans may be evicted.
                 reason = "skip_timeout"
             elif latest > (
-                camera_stamp + self.period_ns + self.tolerance_ns
+                camera_stamp + self.offsets[-1] * self.period_ns
+                + self.tolerance_ns
             ):
                 # A later scan already arrived, so a required scan is
                 # absent. Do not substitute a neighboring scan.
@@ -281,10 +332,11 @@ class LidarMerger(Node):
 
             self.pending_cameras.popleft()
             self.counts[reason] += 1
-            self.get_logger().warn(
-                f"{reason}: camera {camera_stamp}, "
-                f"scans {selected}"
-            )
+            if self.log_skips:
+                self.get_logger().warn(
+                    f"{reason}: camera {camera_stamp}, "
+                    f"scans {selected}"
+                )
 
         self.evict()
 
@@ -295,14 +347,14 @@ class LidarMerger(Node):
         oldest_needed = (
             self.last_lidar_stamp
             - self.max_wait_ns
-            - self.period_ns
+            + self.offsets[0] * self.period_ns
             - self.tolerance_ns
         )
         if self.pending_cameras:
             oldest_needed = min(
                 oldest_needed,
                 self.pending_cameras[0]
-                - self.period_ns
+                + self.offsets[0] * self.period_ns
                 - self.tolerance_ns,
             )
 
@@ -311,6 +363,99 @@ class LidarMerger(Node):
             if stamp >= oldest_needed:
                 break
             del self.scans[stamp]
+
+    # ---- camera_trigger:=false (one full scan per message) ---------------
+
+    def publish_scan(self, stamp, msg):
+        """Publish one scan unchanged in stamp and frame_id, then pair."""
+        start = time.perf_counter()
+        try:
+            points = extract_xyz(msg)
+            output = make_cloud(points, msg.header.stamp,
+                                msg.header.frame_id)
+            self.cloud_pub.publish(output)
+        except Exception as exc:
+            self.counts["failed"] += 1
+            self.get_logger().error(
+                f"LiDAR publish failed for scan {stamp}: {exc}"
+            )
+            return
+
+        self.counts["published"] += 1
+        self.merge_ms.append((time.perf_counter() - start) * 1e3)
+        self.published[stamp] = len(points)
+        self.pair_cameras()
+
+    def find_published(self, camera_stamp):
+        for stamp in self.published:
+            if abs(stamp - camera_stamp) <= self.tolerance_ns:
+                return stamp
+        return None
+
+    def pair_cameras(self):
+        """Send merge_sync for pending cameras whose scan was published."""
+        latest = self.last_lidar_stamp
+
+        while self.pending_cameras:
+            camera_stamp = self.pending_cameras[0]
+            scan = self.find_published(camera_stamp)
+
+            if scan is not None and self.published[scan] is not None:
+                self.pending_cameras.popleft()
+                self.publish_sync(camera_stamp, scan)
+                continue
+
+            if scan is None and (
+                latest is None
+                or latest <= camera_stamp + self.tolerance_ns
+            ):
+                break  # its scan may still arrive
+
+            # A later scan already arrived (scans arrive in stamp order),
+            # or the scan in tolerance is taken by another camera frame.
+            self.pending_cameras.popleft()
+            self.counts["camera_no_scan"] += 1
+            if self.log_skips:
+                self.get_logger().warn(
+                    f"camera_no_scan: camera {camera_stamp}"
+                )
+
+        self.evict_published()
+
+    def publish_sync(self, camera_stamp, scan_stamp):
+        metadata = String()
+        metadata.data = json.dumps({
+            "camera_stamp_ns": camera_stamp,
+            "lidar_stamps_ns": [scan_stamp],
+            "point_count": self.published[scan_stamp],
+        })
+        self.sync_pub.publish(metadata)
+        self.published[scan_stamp] = None
+        self.counts["sync_published"] += 1
+
+    def evict_published(self):
+        if self.last_lidar_stamp is None:
+            return
+
+        oldest_needed = (
+            self.last_lidar_stamp - self.max_wait_ns - self.tolerance_ns
+        )
+        if self.pending_cameras:
+            oldest_needed = min(
+                oldest_needed,
+                self.pending_cameras[0] - self.tolerance_ns,
+            )
+
+        while self.published:
+            stamp = next(iter(self.published))
+            if stamp >= oldest_needed:
+                break
+            self.count_unpaired_scans({stamp: self.published.pop(stamp)})
+
+    def count_unpaired_scans(self, entries):
+        unpaired = sum(1 for v in entries.values() if v is not None)
+        if unpaired:
+            self.counts["scan_no_camera"] += unpaired
 
     def merge(self, camera_stamp, lidar_stamps):
         start = time.perf_counter()
@@ -362,6 +507,11 @@ class LidarMerger(Node):
                 f"p95={np.percentile(v, 95):.1f} "
                 f"max={v.max():.1f} ms"
             )
+
+        if not self.camera_trigger:
+            # Scans still waiting for a camera frame at shutdown.
+            self.count_unpaired_scans(self.published)
+            self.published.clear()
 
         self.get_logger().info(
             f"Counts={dict(self.counts)}, "

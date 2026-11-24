@@ -199,10 +199,14 @@ def main():
     parser.add_argument("report")
     parser.add_argument("bag_dir")
     parser.add_argument("--json")
+    parser.add_argument("--gt-frames", choices=("camera", "scan"),
+                        default="scan",
+                        help="GT frames (default: one per LiDAR scan; "
+                             "camera = previous behavior)")
     args = parser.parse_args()
     with open(args.report, encoding="utf8") as handle:
         report = json.load(handle)
-    gt_frames, scene = read_gt(args.bag_dir)
+    gt_frames, scene = read_gt(args.bag_dir, args.gt_frames)
     result = evaluate(report, gt_frames, scene)
     print(json.dumps({k: v for k, v in result.items() if k != "alarms"}))
     if args.json:

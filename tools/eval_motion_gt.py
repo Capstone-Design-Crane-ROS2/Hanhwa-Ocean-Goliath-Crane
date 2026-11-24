@@ -65,10 +65,16 @@ MOVING_SPEED = 0.3
 DETECTED = ("ok", "split")
 
 
-def detect_bag(bag_dir, cache_dir=None):
-    """Per-frame detections of a bag (cached when cache_dir is given)."""
+def detect_bag(bag_dir, cache_dir=None, gt_frames="camera"):
+    """Per-frame detections of a bag (cached when cache_dir is given).
+
+    gt_frames: "camera" (every GT frame, the previous behavior and the
+    library default; cache <bag>.pkl) or "scan" (one GT frame per LiDAR
+    scan, eval_objects_gt; cache <bag>.scan.pkl).
+    """
     name = os.path.basename(os.path.normpath(bag_dir))
-    path = os.path.join(cache_dir, name + ".pkl") if cache_dir else None
+    suffix = ".pkl" if gt_frames == "camera" else f".{gt_frames}.pkl"
+    path = os.path.join(cache_dir, name + suffix) if cache_dir else None
     if path and os.path.exists(path):
         with open(path, "rb") as handle:
             return pickle.load(handle)
@@ -76,7 +82,7 @@ def detect_bag(bag_dir, cache_dir=None):
     from eval_objects_gt import (
         EvalConfig, evaluate_frame, gt_boxes, load_preprocessed,
     )
-    pose, scene, frames = load_preprocessed(bag_dir)
+    pose, scene, frames = load_preprocessed(bag_dir, gt_frames=gt_frames)
     sensor = pose.to_reference(np.zeros((1, 3)))[0]
     out = []
     for frame in frames:
@@ -352,6 +358,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("paths", nargs="+")
     parser.add_argument("--cache-dir")
+    parser.add_argument("--gt-frames", choices=("camera", "scan"),
+                        default="scan",
+                        help="GT frames (default: one per LiDAR scan; "
+                             "camera = previous behavior)")
     parser.add_argument("--json")
     parser.add_argument("--drop-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
@@ -377,7 +387,7 @@ def main():
 
     runs, pooled, per_bag = [], defaultdict(list), {}
     for bag in bag_list(args.paths):
-        data = detect_bag(bag, args.cache_dir)
+        data = detect_bag(bag, args.cache_dir, args.gt_frames)
         boundary = None
         if args.virtual_plane:
             px, py, nx, ny = args.virtual_plane

@@ -14,6 +14,16 @@ Per GT object (only frames where it has points):
 Totals also give MT/ML (tracked by its main ID in >= 80 % / < 20 % of its
 detected frames) and, for moving GT, the track velocity error.
 
+Events (--events, per GT object, for case analysis):
+    confirmed   first frame with a confirmed track ID
+    switch      tracked ID differs from the previous tracked ID
+    lost        tracked -> observable but not tracked (status says whether
+                the object was undetected, split, merged, or detected with
+                a not yet confirmed track)
+    reacquired  not tracked -> tracked again (a fragment)
+Each event has the frame index (GT scan frame order), stamp_ns, track IDs,
+the frame status and the statuses of the surrounding frames.
+
 Robustness options:
     --drop-rate P   skip frames at random (tracker never sees them)
     --fixed-dt      give the tracker index * 83 ms instead of real stamps,
@@ -42,6 +52,8 @@ from eval_objects_gt import (  # noqa: E402
     evaluate_frame,
     gt_boxes,
     load_preprocessed,
+    GT_FRAME_MODES,
+    UnsupportedBag,
 )
 from object_tracker import ObjectTracker, TrackerParams  # noqa: E402
 
@@ -182,6 +194,40 @@ def summarize_object(entries):
     }
 
 
+def object_events(entries, context=2):
+    """ID events of one GT object (see module docstring)."""
+    events = []
+    last_id, was_tracked = None, False
+    for k, entry in enumerate(entries):
+        tid = entry["track_id"]
+        event = None
+        if tid is not None and last_id is None:
+            event = {"type": "confirmed", "track_id": tid}
+        elif tid is not None and tid != last_id:
+            event = {"type": "switch", "from": last_id, "to": tid}
+        elif tid is not None and not was_tracked:
+            event = {"type": "reacquired", "track_id": tid}
+        elif tid is None and was_tracked:
+            event = {"type": "lost", "track_id": last_id}
+        if event is not None:
+            event.update({
+                "index": entry["index"],
+                "stamp_ns": entry["stamp_ns"],
+                "status": entry["status"],
+                "detected": entry["detected"],
+                "gap_frames": (entry["index"] - entries[k - 1]["index"] - 1
+                               if k else 0),
+                "window": [(e["index"], e["status"], e["track_id"])
+                           for e in entries[max(0, k - context):
+                                            k + context]],
+            })
+            events.append(event)
+        if tid is not None:
+            last_id = tid
+        was_tracked = tid is not None
+    return events
+
+
 def summarize(objects, stats):
     totals = {key: sum(o[key] for o in objects.values())
               for key in ("observable", "detected", "tracked",
@@ -220,13 +266,29 @@ def summarize(objects, stats):
     return summary
 
 
-def evaluate_bag(bag_dir, config, params, **options):
-    pose, scene, frames = load_preprocessed(bag_dir)
+def evaluate_loaded(pose, scene, frames, config, params, events=False,
+                    **options):
+    """(summary, per-object results) of preprocessed frames."""
     entries, stats = track_frames(pose, scene, frames, config, params,
                                   **options)
     objects = {gid: summarize_object(items)
                for gid, items in entries.items()}
+    if events:
+        for gid, items in entries.items():
+            objects[gid]["events"] = object_events(items)
     return summarize(objects, stats), objects
+
+
+def evaluate_bag(bag_dir, config, params, events=False, gt_frames="camera",
+                 **options):
+    """(summary, per-object results) of one bag.
+
+    gt_frames: "camera" (every GT frame, the previous behavior and the
+    library default) or "scan" (one per LiDAR scan, eval_objects_gt).
+    """
+    pose, scene, frames = load_preprocessed(bag_dir, gt_frames=gt_frames)
+    return evaluate_loaded(pose, scene, frames, config, params, events,
+                           **options)
 
 
 def main():
@@ -236,6 +298,12 @@ def main():
     parser.add_argument("--drop-rate", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--fixed-dt", action="store_true")
+    parser.add_argument("--gt-frames", choices=GT_FRAME_MODES,
+                        default="scan",
+                        help="GT frames (default: one per LiDAR scan; "
+                             "camera = every GT frame, previous behavior)")
+    parser.add_argument("--events", action="store_true",
+                        help="add per-object ID events to the JSON")
     defaults = TrackerParams()
     parser.add_argument("--min-hits", type=int, default=defaults.min_hits)
     parser.add_argument("--max-coast", type=float,
@@ -256,12 +324,26 @@ def main():
     results = {}
     for path in args.paths:
         for bag in bag_dirs(path):
-            summary, objects = evaluate_bag(
-                bag, EvalConfig(), params, drop_rate=args.drop_rate,
-                seed=args.seed, fixed_dt=args.fixed_dt,
-            )
+            try:
+                pose, scene, frames = load_preprocessed(
+                    bag, gt_frames=args.gt_frames)
+                selection = scene.get("eval_gt_selection")
+                summary, objects = evaluate_loaded(
+                    pose, scene, frames, EvalConfig(), params,
+                    events=args.events,
+                    drop_rate=args.drop_rate, seed=args.seed,
+                    fixed_dt=args.fixed_dt,
+                )
+            except UnsupportedBag as exc:
+                print(f"skipped: {exc}", flush=True)
+                continue
             name = os.path.basename(bag)
             results[name] = {"summary": summary, "objects": objects}
+            if selection and (selection["duplicates_removed"]
+                              or selection["objects_shifted_to_lidar"]):
+                # 2nd dataset only; 1st dataset output is unchanged.
+                results[name]["gt_selection"] = selection
+                print(f"{name}: GT {selection}")
             print(
                 f"{name}: frames={summary['frames']} "
                 f"gt={summary['gt_objects']} "
