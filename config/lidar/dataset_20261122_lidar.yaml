@@ -1,0 +1,21 @@
+# LiDAR-only verification config for the 2nd dataset (캡스톤디자인2_ROSbag_2차_
+# 20261122). Same values as config/system/dataset_20261122.yaml (the system /
+# risk replay config, left unchanged) plus camera_trigger: false, so every
+# /point_cloud_A scan reaches /point_cloud_360 also where the bag misses the
+# camera frame at the scan stamp (S08: 285 instead of 238 frames).
+# /lidar/merge_sync is still published for every scan that has a camera
+# frame. Use for LiDAR evaluation runs; see docs/report_step6_dataset2_merge.md.
+lidar_merge_360:
+  ros__parameters:
+    scan_offsets: [0]
+    log_skips: false
+    camera_trigger: false
+
+lidar_object_node:
+  ros__parameters:
+    crane:
+      face_point_x: 156.0
+      face_point_y: 0.052
+      face_normal_x: 1.0
+      face_normal_y: 0.0
+      exclusion_boxes: [136.0, -35.0, 4.5, 156.0, 35.0, 12.0]

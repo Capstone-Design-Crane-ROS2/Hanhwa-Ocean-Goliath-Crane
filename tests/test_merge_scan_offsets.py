@@ -1,4 +1,5 @@
-"""lidar_merge_360 scan selection: default 3-scan merge and scan_offsets:=[0].
+"""lidar_merge_360 scan selection: default 3-scan merge, scan_offsets:=[0]
+and camera_trigger:=false (every single full scan published).
 
 The node is driven directly (callbacks with hand-made messages, publishers
 replaced by lists), no DDS traffic.
@@ -82,6 +83,83 @@ class MergeOffsetsTest(unittest.TestCase):
         # Each scan is published once and unchanged in size.
         self.assertTrue(all(c.width == 4 for c in clouds))
 
+
+    # ---- camera_trigger:=false ------------------------------------------
+
+    def make_lidar_mode(self):
+        return self.make("-p", "scan_offsets:=[0]",
+                         "-p", "camera_trigger:=false",
+                         "-p", "log_skips:=false")
+
+    def test_camera_trigger_false_needs_single_scan(self):
+        rclpy.init(args=["--ros-args", "-p", "camera_trigger:=false"])
+        self.addCleanup(rclpy.shutdown)
+        with self.assertRaises(ValueError):
+            LidarMerger()
+
+    def test_every_scan_published_once_without_camera(self):
+        node, clouds, syncs = self.make_lidar_mode()
+        base = 3_000 * P
+        scans = [base + 3 * j * P for j in range(4)]
+        # 2nd dataset pattern, camera frame of scan 1 missing in the bag;
+        # cameras arrive after their scan.
+        for j, scan_ns in enumerate(scans):
+            self.scan(node, scan_ns)
+            for k in range(3):
+                if not (j == 1 and k == 0):
+                    self.camera(node, scan_ns + k * P)
+        stamps = [c.header.stamp.sec * 10**9 + c.header.stamp.nanosec
+                  for c in clouds]
+        self.assertEqual(stamps, scans)
+        self.assertTrue(all(c.header.frame_id == "OS1_A" for c in clouds))
+        self.assertTrue(all(c.width == 4 for c in clouds))
+        self.assertEqual([s["camera_stamp_ns"] for s in syncs],
+                         [scans[0], scans[2], scans[3]])
+        self.assertEqual([s["lidar_stamps_ns"] for s in syncs],
+                         [[scans[0]], [scans[2]], [scans[3]]])
+        self.assertTrue(all(s["point_count"] == 4 for s in syncs))
+        node.report()
+        self.assertEqual(node.counts["published"], 4)
+        self.assertEqual(node.counts["sync_published"], 3)
+        self.assertEqual(node.counts["scan_no_camera"], 1)
+        # 2 non-scan cameras per scan, minus the last scan's two (pending).
+        self.assertEqual(node.counts["camera_no_scan"], 6)
+
+    def test_camera_before_scan_is_paired(self):
+        node, clouds, syncs = self.make_lidar_mode()
+        base = 3_000 * P
+        self.camera(node, base + 1_000_000)  # 1 ms off, within tolerance
+        self.assertEqual(syncs, [])
+        self.scan(node, base)
+        self.assertEqual(len(clouds), 1)
+        self.assertEqual(syncs[0]["camera_stamp_ns"], base + 1_000_000)
+        self.assertEqual(syncs[0]["lidar_stamps_ns"], [base])
+
+    def test_one_sync_per_scan_and_no_duplicates(self):
+        node, clouds, syncs = self.make_lidar_mode()
+        base = 3_000 * P
+        self.scan(node, base)
+        self.scan(node, base)                    # duplicate scan
+        self.camera(node, base)
+        self.camera(node, base)                  # duplicate camera
+        self.camera(node, base + 1_000_000)      # second camera, same scan
+        self.assertEqual(len(clouds), 1)
+        self.assertEqual(len(syncs), 1)
+        self.assertEqual(node.counts["dup_lidar"], 1)
+        self.assertEqual(node.counts["dup_camera"], 1)
+        self.scan(node, base + 3 * P)
+        self.assertEqual(node.counts["camera_no_scan"], 1)
+
+    def test_backwards_stamp_resets_and_keeps_publishing(self):
+        node, clouds, syncs = self.make_lidar_mode()
+        base = 3_000 * P
+        self.scan(node, base)
+        self.scan(node, base - 30 * P)           # bag restart
+        self.camera(node, base - 30 * P)
+        self.assertEqual(len(clouds), 2)
+        self.assertEqual(node.counts["reset"], 1)
+        self.assertEqual(node.counts["scan_no_camera"], 1)
+        self.assertEqual(syncs[-1]["lidar_stamps_ns"], [base - 30 * P])
 
 if __name__ == "__main__":
     unittest.main()
