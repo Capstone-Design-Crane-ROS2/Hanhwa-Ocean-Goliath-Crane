@@ -8,7 +8,7 @@ root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(root / "lidar"))
 sys.path.insert(0, str(root / "tools"))
 
-from eval_tracking_gt import summarize_object  # noqa: E402
+from eval_tracking_gt import object_events, summarize_object  # noqa: E402
 
 
 def entries(track_ids, detected=None, speed=0.0):
@@ -65,6 +65,31 @@ class SummarizeObjectTest(unittest.TestCase):
         still = summarize_object(entries([1] * 5, speed=0.0))
         self.assertEqual(still["velocity_errors"], [])
 
+
+class ObjectEventsTest(unittest.TestCase):
+    def test_events(self):
+        e = entries([None, 3, 3, None, 3, 5, 5],
+                    detected=[True, True, True, False, True, True, True])
+        e[3]["status"] = "split"
+        events = object_events(e)
+        self.assertEqual([x["type"] for x in events],
+                         ["confirmed", "lost", "reacquired", "switch"])
+        lost = events[1]
+        self.assertEqual((lost["index"], lost["status"], lost["detected"]),
+                         (3, "split", False))
+        switch = events[3]
+        self.assertEqual((switch["from"], switch["to"], switch["index"],
+                          switch["stamp_ns"]), (3, 5, 5, 500_000_000))
+        self.assertEqual(switch["window"],
+                         [(3, "split", None), (4, "ok", 3), (5, "ok", 5),
+                          (6, "ok", 5)])
+
+    def test_gap_frames(self):
+        e = entries([3, 4])
+        e[1]["index"] = 4  # frames 1-3 had no points (not in entries)
+        events = object_events(e)
+        self.assertEqual(events[1]["type"], "switch")
+        self.assertEqual(events[1]["gap_frames"], 3)
 
 if __name__ == "__main__":
     unittest.main()
